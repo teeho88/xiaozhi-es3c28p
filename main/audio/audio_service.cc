@@ -122,48 +122,90 @@ void AudioService::Initialize(AudioCodec* codec) {
     esp_timer_create(&audio_power_timer_args, &audio_power_timer_);
 }
 
+// Static task with the stack in PSRAM. The service restarts after exclusive
+// video mode, when internal RAM is too fragmented for plain xTaskCreate (the
+// 24 KB opus stack in particular) — a silent failure here leaves the encode
+// queue without a consumer and voice chat dead.
+TaskHandle_t AudioService::StartServiceTask(TaskFunction_t entry, const char* name, size_t stack_size,
+        UBaseType_t priority, BaseType_t core, StackType_t** stack, StaticTask_t** tcb) {
+    if (*stack == nullptr) {
+        *stack = (StackType_t*)heap_caps_malloc(stack_size, MALLOC_CAP_SPIRAM);
+    }
+    if (*tcb == nullptr) {
+        *tcb = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    }
+    if (*stack == nullptr || *tcb == nullptr) {
+        ESP_LOGE(TAG, "No memory for task %s", name);
+        return nullptr;
+    }
+    TaskHandle_t handle;
+    if (core >= 0) {
+        handle = xTaskCreateStaticPinnedToCore(entry, name, stack_size, this, priority, *stack, *tcb, core);
+    } else {
+        handle = xTaskCreateStatic(entry, name, stack_size, this, priority, *stack, *tcb);
+    }
+    if (handle == nullptr) {
+        ESP_LOGE(TAG, "Failed to create task %s", name);
+    }
+    return handle;
+}
+
 void AudioService::Start() {
+    // The static stacks are reused across Stop()/Start() cycles: make sure
+    // tasks from the previous cycle have fully exited first
+    for (int i = 0; i < 100 && running_task_count_ > 0; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (running_task_count_ > 0) {
+        ESP_LOGE(TAG, "Previous audio tasks still running, not restarting");
+        return;
+    }
+
     service_stopped_ = false;
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
 
     esp_timer_start_periodic(audio_power_timer_, 1000000);
 
 #if CONFIG_USE_AUDIO_PROCESSOR
-    /* Start the audio input task */
-    xTaskCreatePinnedToCore([](void* arg) {
-        AudioService* audio_service = (AudioService*)arg;
-        audio_service->AudioInputTask();
-        vTaskDelete(NULL);
-    }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
-
-    /* Start the audio output task */
-    xTaskCreate([](void* arg) {
-        AudioService* audio_service = (AudioService*)arg;
-        audio_service->AudioOutputTask();
-        vTaskDelete(NULL);
-    }, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);
+    constexpr size_t kInputStack = 2048 * 3;
+    constexpr size_t kOutputStack = 2048 * 2;
+    constexpr BaseType_t kInputCore = 0;
 #else
-    /* Start the audio input task */
-    xTaskCreate([](void* arg) {
-        AudioService* audio_service = (AudioService*)arg;
-        audio_service->AudioInputTask();
-        vTaskDelete(NULL);
-    }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_);
-
-    /* Start the audio output task */
-    xTaskCreate([](void* arg) {
-        AudioService* audio_service = (AudioService*)arg;
-        audio_service->AudioOutputTask();
-        vTaskDelete(NULL);
-    }, "audio_output", 2048, this, 4, &audio_output_task_handle_);
+    constexpr size_t kInputStack = 2048 * 2;
+    constexpr size_t kOutputStack = 2048;
+    constexpr BaseType_t kInputCore = -1;
 #endif
 
+    running_task_count_++;
+    if (StartServiceTask([](void* arg) {
+        AudioService* audio_service = (AudioService*)arg;
+        audio_service->AudioInputTask();
+        audio_service->running_task_count_--;
+        vTaskDelete(NULL);
+    }, "audio_input", kInputStack, 8, kInputCore, &input_task_stack_, &input_task_tcb_) == nullptr) {
+        running_task_count_--;
+    }
+
+    running_task_count_++;
+    if (StartServiceTask([](void* arg) {
+        AudioService* audio_service = (AudioService*)arg;
+        audio_service->AudioOutputTask();
+        audio_service->running_task_count_--;
+        vTaskDelete(NULL);
+    }, "audio_output", kOutputStack, 4, -1, &output_task_stack_, &output_task_tcb_) == nullptr) {
+        running_task_count_--;
+    }
+
     /* Start the opus codec task */
-    xTaskCreate([](void* arg) {
+    running_task_count_++;
+    if (StartServiceTask([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
+        audio_service->running_task_count_--;
         vTaskDelete(NULL);
-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+    }, "opus_codec", 2048 * 12, 2, -1, &opus_task_stack_, &opus_task_tcb_) == nullptr) {
+        running_task_count_--;
+    }
 }
 
 void AudioService::Stop() {
@@ -513,6 +555,44 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
         }
     }
     audio_decode_queue_.push_back(std::move(packet));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, int sample_rate, bool wait) {
+    if (pcm.empty()) {
+        return true;
+    }
+    if (sample_rate > 0 && codec_ != nullptr && sample_rate != codec_->output_sample_rate()) {
+        esp_ae_rate_cvt_handle_t resampler = nullptr;
+        esp_ae_rate_cvt_cfg_t resampler_cfg = RATE_CVT_CFG(sample_rate, codec_->output_sample_rate(), ESP_AUDIO_MONO);
+        if (esp_ae_rate_cvt_open(&resampler_cfg, &resampler) == ESP_OK && resampler != nullptr) {
+            uint32_t target_size = 0;
+            esp_ae_rate_cvt_get_max_out_sample_num(resampler, pcm.size(), &target_size);
+            std::vector<int16_t> resampled(target_size);
+            uint32_t actual_output = target_size;
+            esp_ae_rate_cvt_process(resampler, (esp_ae_sample_t)pcm.data(), pcm.size(),
+                (esp_ae_sample_t)resampled.data(), &actual_output);
+            esp_ae_rate_cvt_close(resampler);
+            resampled.resize(actual_output);
+            pcm = std::move(resampled);
+        }
+    }
+
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->timestamp = 0;
+    task->pcm = std::move(pcm);
+
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    if (audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE) {
+        if (wait) {
+            audio_queue_cv_.wait(lock, [this]() { return audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE; });
+        } else {
+            return false;
+        }
+    }
+    audio_playback_queue_.push_back(std::move(task));
     audio_queue_cv_.notify_all();
     return true;
 }

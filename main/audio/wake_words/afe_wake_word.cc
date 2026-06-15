@@ -80,11 +80,31 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
 
-    xTaskCreate([](void* arg) {
+    // Static task with the stack in PSRAM (same pattern as encode_wake_word):
+    // internal RAM can be too fragmented for a plain xTaskCreate, which used
+    // to fail silently here and leave the AFE feed without a consumer
+    // ("Ringbuffer of AFE(FEED) is full" spam and a dead microphone).
+    const size_t detect_stack_size = 8192;
+    if (audio_detection_task_stack_ == nullptr) {
+        audio_detection_task_stack_ = (StackType_t*)heap_caps_malloc(detect_stack_size, MALLOC_CAP_SPIRAM);
+    }
+    if (audio_detection_task_buffer_ == nullptr) {
+        audio_detection_task_buffer_ = (StaticTask_t*)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    }
+    if (audio_detection_task_stack_ == nullptr || audio_detection_task_buffer_ == nullptr) {
+        ESP_LOGE(TAG, "No memory for audio_detection task");
+        return false;
+    }
+    auto detect_task = xTaskCreateStatic([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
         this_->AudioDetectionTask();
         vTaskDelete(NULL);
-    }, "audio_detection", 4096, this, 3, nullptr);
+    }, "audio_detection", detect_stack_size, this, 3,
+        audio_detection_task_stack_, audio_detection_task_buffer_);
+    if (detect_task == nullptr) {
+        ESP_LOGE(TAG, "Failed to create audio_detection task");
+        return false;
+    }
 
     return true;
 }

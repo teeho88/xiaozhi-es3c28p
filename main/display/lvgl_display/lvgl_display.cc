@@ -20,6 +20,9 @@ LvglDisplay::LvglDisplay() {
     esp_timer_create_args_t notification_timer_args = {
         .callback = [](void *arg) {
             LvglDisplay *display = static_cast<LvglDisplay*>(arg);
+            if (display->video_overlay_active_) {
+                return;
+            }
             DisplayLockGuard lock(display);
             lv_obj_add_flag(display->notification_label_, LV_OBJ_FLAG_HIDDEN);
             lv_obj_remove_flag(display->status_label_, LV_OBJ_FLAG_HIDDEN);
@@ -70,6 +73,9 @@ LvglDisplay::~LvglDisplay() {
 }
 
 void LvglDisplay::SetStatus(const char* status) {
+    if (video_overlay_active_) {
+        return;
+    }
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetStatus('%s') called before SetupUI() - message will be lost!", status);
     }
@@ -92,6 +98,9 @@ void LvglDisplay::ShowNotification(const std::string &notification, int duration
 }
 
 void LvglDisplay::ShowNotification(const char* notification, int duration_ms) {
+    if (video_overlay_active_) {
+        return;
+    }
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "ShowNotification('%s') called before SetupUI() - message will be lost!", notification);
     }
@@ -111,6 +120,9 @@ void LvglDisplay::ShowNotification(const char* notification, int duration_ms) {
 }
 
 void LvglDisplay::UpdateStatusBar(bool update_all) {
+    if (video_overlay_active_) {
+        return;
+    }
     auto& app = Application::GetInstance();
     auto& board = Board::GetInstance();
     auto codec = board.GetAudioCodec();
@@ -122,13 +134,13 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
             return;
         }
 
-        // Update icon if mute state changes
-        if (codec->output_volume() == 0 && !muted_) {
-            muted_ = true;
-            lv_label_set_text(mute_label_, FONT_AWESOME_VOLUME_XMARK);
-        } else if (codec->output_volume() > 0 && muted_) {
-            muted_ = false;
-            lv_label_set_text(mute_label_, "");
+        // Icon is always visible so it can act as a touch target for
+        // toggling between sound and silent mode
+        bool muted = codec->output_volume() == 0;
+        if (muted != muted_ || !mute_icon_inited_) {
+            muted_ = muted;
+            mute_icon_inited_ = true;
+            lv_label_set_text(mute_label_, muted_ ? FONT_AWESOME_VOLUME_XMARK : FONT_AWESOME_VOLUME_HIGH);
         }
     }
 
@@ -219,6 +231,50 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
 }
 
 void LvglDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+}
+
+void LvglDisplay::SetVideoOverlayActive(bool active) {
+    video_overlay_active_ = active;
+    if (!setup_ui_called_) {
+        return;
+    }
+
+    DisplayLockGuard lock(this);
+    esp_timer_stop(notification_timer_);
+    if (notification_label_ != nullptr) {
+        lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (status_label_ != nullptr) {
+        if (active) {
+            lv_obj_add_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (mute_label_ != nullptr) {
+        if (active) {
+            lv_obj_add_flag(mute_label_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(mute_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (battery_label_ != nullptr) {
+        if (active) {
+            lv_obj_add_flag(battery_label_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(battery_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (network_label_ != nullptr) {
+        if (active) {
+            lv_obj_add_flag(network_label_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(network_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (low_battery_popup_ != nullptr) {
+        lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void LvglDisplay::SetPowerSaveMode(bool on) {

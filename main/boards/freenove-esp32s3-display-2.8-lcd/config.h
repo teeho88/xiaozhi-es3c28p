@@ -3,8 +3,8 @@
 
 #include <driver/gpio.h>
 
-#define AUDIO_INPUT_SAMPLE_RATE  24000
-#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+#define AUDIO_INPUT_SAMPLE_RATE  16000
+#define AUDIO_OUTPUT_SAMPLE_RATE 16000
 
 //音频iis部分
 #define AUDIO_I2S_GPIO_MCLK      GPIO_NUM_4  //MCLK
@@ -33,20 +33,23 @@
 #define DISPLAY_CS_PIN        GPIO_NUM_10
 #define DISPLAY_MOSI_PIN      GPIO_NUM_11
 #define DISPLAY_MIS0_PIN      GPIO_NUM_13
-#define DISPLAY_SPI_SCLK_HZ   (20 * 1000 * 1000)
+#define DISPLAY_SPI_SCLK_HZ   (40 * 1000 * 1000)
 
 #define LCD_SPI_HOST          SPI3_HOST
 
 #define LCD_TYPE_ILI9341_SERIAL
-#define DISPLAY_WIDTH         320
-#define DISPLAY_HEIGHT        240
-#define DISPLAY_MIRROR_X      false
+// Portrait base orientation (chat UI). The clock home screen rotates the
+// display to landscape at runtime via lv_display_set_rotation().
+#define DISPLAY_WIDTH         240
+#define DISPLAY_HEIGHT        320
+#define DISPLAY_MIRROR_X      true
 #define DISPLAY_MIRROR_Y      false
-#define DISPLAY_SWAP_XY       true
+#define DISPLAY_SWAP_XY       false
 #define DISPLAY_INVERT_COLOR  true
 #define DISPLAY_RGB_ORDER     LCD_RGB_ELEMENT_ORDER_BGR
 #define DISPLAY_OFFSET_X      0
 #define DISPLAY_OFFSET_Y      0
+
 #define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
 #define DISPLAY_SPI_MODE      0
 

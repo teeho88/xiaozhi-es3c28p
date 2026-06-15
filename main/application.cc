@@ -71,6 +71,7 @@ void Application::Initialize() {
     // Setup the audio service
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
+    codec->SetOutputVolume(0);
     audio_service_.Start();
 
     AudioServiceCallbacks callbacks;
@@ -510,7 +511,10 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        board.SetPowerSaveLevel(exclusive_video_mode_ ? PowerSaveLevel::PERFORMANCE : PowerSaveLevel::LOW_POWER);
+        if (exclusive_video_mode_) {
+            return;
+        }
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
@@ -551,7 +555,23 @@ void Application::InitializeProtocol() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring)]() {
+                auto message = std::string(text->valuestring);
+                bool suppress_keyboard_echo = false;
+                {
+                    std::lock_guard<std::mutex> lock(text_chat_mutex_);
+                    const int64_t now_ms = esp_timer_get_time() / 1000;
+                    if (!pending_text_chat_echo_.empty() &&
+                            message == pending_text_chat_echo_ &&
+                            now_ms - pending_text_chat_echo_ms_ < 10000) {
+                        suppress_keyboard_echo = true;
+                        pending_text_chat_echo_.clear();
+                    }
+                }
+                if (suppress_keyboard_echo) {
+                    ESP_LOGI(TAG, "Suppressing keyboard text echo from STT: %s", message.c_str());
+                    return;
+                }
+                Schedule([display, message = std::move(message)]() {
                     display->SetChatMessage("user", message.c_str());
                 });
             }
@@ -687,26 +707,25 @@ void Application::HandleToggleChatEvent() {
         return;
     }
 
-    if (!protocol_) {
-        ESP_LOGE(TAG, "Protocol not initialized");
-        return;
-    }
-
     if (state == kDeviceStateIdle) {
-        ListeningMode mode = GetDefaultListeningMode();
+        if (!protocol_) {
+            return;
+        }
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update)
-            Schedule([this, mode]() {
-                ContinueOpenAudioChannel(mode);
+            Schedule([this]() {
+                ContinueOpenAudioChannel(GetDefaultListeningMode());
             });
             return;
         }
-        SetListeningMode(mode);
+        SetListeningMode(GetDefaultListeningMode());
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
-        protocol_->CloseAudioChannel();
+        if (protocol_) {
+            protocol_->CloseAudioChannel();
+        }
+        SetDeviceState(kDeviceStateIdle);
     }
 }
 
@@ -741,24 +760,23 @@ void Application::HandleStartListeningEvent() {
         return;
     }
 
-    if (!protocol_) {
-        ESP_LOGE(TAG, "Protocol not initialized");
-        return;
-    }
-    
     if (state == kDeviceStateIdle) {
+        if (!protocol_) {
+            return;
+        }
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update)
             Schedule([this]() {
-                ContinueOpenAudioChannel(kListeningModeManualStop);
+                ContinueOpenAudioChannel(GetDefaultListeningMode());
             });
             return;
         }
-        SetListeningMode(kListeningModeManualStop);
+        SetListeningMode(GetDefaultListeningMode());
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
-        SetListeningMode(kListeningModeManualStop);
+        if (protocol_) {
+            SetListeningMode(GetDefaultListeningMode());
+        }
     }
 }
 
@@ -778,36 +796,18 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
-    if (!protocol_) {
-        return;
-    }
-
     auto state = GetDeviceState();
     auto wake_word = audio_service_.GetLastWakeWord();
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
 
     if (state == kDeviceStateIdle) {
-        audio_service_.EncodeWakeWord();
-        auto wake_word = audio_service_.GetLastWakeWord();
-
-        if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
-            // Schedule to let the state change be processed first (UI update),
-            // then continue with OpenAudioChannel which may block for ~1 second
-            Schedule([this, wake_word]() {
-                ContinueWakeWordInvoke(wake_word);
-            });
-            return;
-        }
-        // Channel already opened, continue directly
-        ContinueWakeWordInvoke(wake_word);
+        WakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
         while (audio_service_.PopPacketFromSendQueue());
 
         if (state == kDeviceStateListening) {
-            protocol_->SendStartListening(GetDefaultListeningMode());
             audio_service_.ResetDecoder();
             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             // Re-enable wake word detection as it was stopped by the detection itself
@@ -873,7 +873,7 @@ void Application::HandleStateChangedEvent() {
             display->ClearChatMessages();  // Clear messages first
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            audio_service_.EnableWakeWordDetection(!exclusive_video_mode_);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1116,6 +1116,122 @@ void Application::SetAecMode(AecMode mode) {
 
 void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
+}
+
+void Application::EnterExclusiveVideoMode() {
+    ESP_LOGI(TAG, "Entering exclusive video mode");
+    exclusive_video_mode_ = true;
+    auto& board = Board::GetInstance();
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    if (clock_timer_handle_ != nullptr) {
+        esp_timer_stop(clock_timer_handle_);
+    }
+    aborted_ = true;
+    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+        protocol_->CloseAudioChannel(false);
+    }
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(false);
+    audio_service_.ResetDecoder();
+    SetDeviceState(kDeviceStateIdle);
+    // Stop the audio service to reclaim internal RAM for the video pipeline
+    // (opus codec task alone holds a 24 KB stack). PC stream audio does not
+    // need it: PcmAudioStreamPlayer writes PCM directly to the codec.
+    audio_service_.Stop();
+    audio_service_stopped_for_video_ = true;
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    xEventGroupClearBits(event_group_,
+        MAIN_EVENT_SEND_AUDIO |
+        MAIN_EVENT_WAKE_WORD_DETECTED |
+        MAIN_EVENT_VAD_CHANGE |
+        MAIN_EVENT_TOGGLE_CHAT |
+        MAIN_EVENT_START_LISTENING |
+        MAIN_EVENT_STOP_LISTENING);
+}
+
+void Application::ExitExclusiveVideoMode() {
+    ESP_LOGI(TAG, "Exiting exclusive video mode");
+    exclusive_video_mode_ = false;
+    auto& board = Board::GetInstance();
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    if (audio_service_stopped_for_video_) {
+        audio_service_.Start();
+        audio_service_stopped_for_video_ = false;
+    }
+    audio_service_.EnableVoiceProcessing(false);
+    audio_service_.EnableWakeWordDetection(true);
+    SetDeviceState(kDeviceStateIdle);
+    Schedule([]() {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus(Lang::Strings::STANDBY);
+        display->SetEmotion("neutral");
+    });
+    if (clock_timer_handle_ != nullptr) {
+        esp_timer_stop(clock_timer_handle_);
+        esp_timer_start_periodic(clock_timer_handle_, 1000000);
+    }
+}
+
+bool Application::SendTextChat(const std::string& text) {
+    if (text.empty()) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(text_chat_mutex_);
+        pending_text_chat_echo_ = text;
+        pending_text_chat_echo_ms_ = esp_timer_get_time() / 1000;
+    }
+
+    auto display = Board::GetInstance().GetDisplay();
+    display->SetChatMessage("user", text.c_str());
+    display->SetStatus(Lang::Strings::CONNECTING);
+
+    Schedule([this, text]() {
+        auto& board = Board::GetInstance();
+        auto display = board.GetDisplay();
+
+        if (exclusive_video_mode_) {
+            display->SetStatus(Lang::Strings::STANDBY);
+            display->SetChatMessage("assistant", "Hay thoat video truoc khi gui chat.");
+            return;
+        }
+
+        if (!protocol_) {
+            display->SetStatus(Lang::Strings::STANDBY);
+            display->SetChatMessage("assistant", "Chua ket noi Xiaozhi server.");
+            return;
+        }
+
+        if (GetDeviceState() == kDeviceStateSpeaking) {
+            AbortSpeaking(kAbortReasonNone);
+        }
+
+        listening_mode_ = kListeningModeManualStop;
+        audio_service_.EnableVoiceProcessing(false);
+        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+
+        if (!protocol_->IsAudioChannelOpened()) {
+            SetDeviceState(kDeviceStateConnecting);
+            if (!protocol_->OpenAudioChannel()) {
+                SetDeviceState(kDeviceStateIdle);
+                display->SetStatus(Lang::Strings::STANDBY);
+                display->SetChatMessage("assistant", "Khong mo duoc ket noi Xiaozhi.");
+                return;
+            }
+        }
+
+        if (!protocol_->SendUserText(text)) {
+            SetDeviceState(kDeviceStateIdle);
+            display->SetStatus(Lang::Strings::STANDBY);
+            display->SetChatMessage("assistant", "Gui text that bai.");
+            return;
+        }
+
+        display->SetStatus("Dang doi tra loi...");
+    });
+    return true;
 }
 
 void Application::ResetProtocol() {

@@ -34,11 +34,24 @@ protected:
     lv_obj_t* chat_message_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+    uint8_t* video_dma_buffers_[2] = {nullptr, nullptr};
+    size_t video_dma_buffer_size_ = 0;
+    uint8_t* video_icon_dma_buffer_ = nullptr;
+    uint8_t* video_previous_rgb332_ = nullptr;
+    size_t video_previous_rgb332_size_ = 0;
+    bool video_previous_rgb332_valid_ = false;
+    bool video_letterbox_cleared_ = false;
+    bool lvgl_stopped_for_video_ = false;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+    // -1 = hidden, 0 = muted, 1 = audio on. Drawn into the top letterbox while
+    // the raw video overlay is active (LVGL is stopped there).
+    std::atomic<int> video_audio_icon_state_{-1};
 
     void InitializeLcdThemes();
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
+    void ClearVideoLetterbox(int src_h);
+    void DrawVideoAudioIcon(int src_h);
 
 protected:
     // Add protected constructor
@@ -50,6 +63,15 @@ public:
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
+    virtual void SetVideoFrame(std::unique_ptr<LvglImage> image);
+    virtual void DrawRgb565FrameDirect(const uint8_t* data, int width, int height, int stride);
+    virtual bool DrawRgb565FrameDirectFast(const uint8_t* data, int width, int height, int stride);
+    virtual bool DrawRgb332FrameDirectFast(const uint8_t* data, int width, int height, int stride);
+    virtual void ResetVideoDirtyCache();
+    virtual void SetVideoAudioIcon(int state);
+    bool PreallocateVideoStripBuffers();
+    virtual void SetRawPanelGeometry(int width, int height, bool mirror_x, bool mirror_y, bool swap_xy);
+    virtual void SetVideoOverlayActive(bool active) override;
     virtual void SetupUI() override;
     // Add theme switching function
     virtual void SetTheme(Theme* theme) override;

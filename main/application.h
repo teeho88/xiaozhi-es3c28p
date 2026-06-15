@@ -114,6 +114,9 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    void EnterExclusiveVideoMode();
+    void ExitExclusiveVideoMode();
+    bool SendTextChat(const std::string& text);
     
     /**
      * Reset protocol resources (thread-safe)
@@ -135,6 +138,9 @@ private:
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
     std::string last_error_message_;
+    std::mutex text_chat_mutex_;
+    std::string pending_text_chat_echo_;
+    int64_t pending_text_chat_echo_ms_ = 0;
     AudioService audio_service_;
     std::unique_ptr<Ota> ota_;
 
@@ -144,6 +150,8 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    bool exclusive_video_mode_ = false;
+    bool audio_service_stopped_for_video_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

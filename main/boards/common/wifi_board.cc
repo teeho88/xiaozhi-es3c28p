@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 #include <esp_network.h>
 #include <esp_log.h>
+#include <algorithm>
 #include <utility>
 
 #include <font_awesome.h>
@@ -25,6 +26,8 @@ static const char *TAG = "WifiBoard";
 
 // Connection timeout in seconds
 static constexpr int CONNECT_TIMEOUT_SEC = 60;
+static constexpr const char* DEFAULT_WIFI_SSID = "alpha";
+static constexpr const char* DEFAULT_WIFI_PASSWORD = "tanho8888";
 
 WifiBoard::WifiBoard() {
     // Create connection timeout timer
@@ -88,6 +91,21 @@ void WifiBoard::StartNetwork() {
 
 void WifiBoard::TryWifiConnect() {
     auto& ssid_manager = SsidManager::GetInstance();
+    const auto& ssid_list = ssid_manager.GetSsidList();
+    auto default_it = std::find_if(ssid_list.begin(), ssid_list.end(), [](const SsidItem& item) {
+        return item.ssid == DEFAULT_WIFI_SSID;
+    });
+    if (default_it != ssid_list.end()) {
+        int index = std::distance(ssid_list.begin(), default_it);
+        if (index != 0) {
+            ssid_manager.SetDefaultSsid(index);
+        }
+        ssid_manager.AddSsid(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASSWORD);
+    } else {
+        ESP_LOGI(TAG, "Adding default WiFi SSID for testing: %s", DEFAULT_WIFI_SSID);
+        ssid_manager.AddSsid(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASSWORD);
+    }
+
     bool have_ssid = !ssid_manager.GetSsidList().empty();
 
     if (have_ssid) {

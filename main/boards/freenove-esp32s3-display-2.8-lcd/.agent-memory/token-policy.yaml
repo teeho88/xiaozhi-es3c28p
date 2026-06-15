@@ -1,0 +1,10 @@
+token_policy:
+  max_prompt_tokens: 4000
+  max_file_snippet_tokens: 1200
+  max_memory_tokens: 800
+  max_logs_tokens: 300
+  max_handoff_tokens: 600
+  prefer_summary_over_raw: true
+  include_tests_first: true
+  include_latest_handoff: true
+  include_decisions: true

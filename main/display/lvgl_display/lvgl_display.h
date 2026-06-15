@@ -23,6 +23,7 @@ public:
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image);
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
+    virtual void SetVideoOverlayActive(bool active) override;
     virtual bool SnapshotToJpeg(std::string& jpeg_data, int quality = 80);
 
 protected:
@@ -40,6 +41,8 @@ protected:
     const char* battery_icon_ = nullptr;
     const char* network_icon_ = nullptr;
     bool muted_ = false;
+    bool mute_icon_inited_ = false;
+    bool video_overlay_active_ = false;
 
     std::chrono::system_clock::time_point last_status_update_time_;
     esp_timer_handle_t notification_timer_ = nullptr;

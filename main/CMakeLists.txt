@@ -824,8 +824,8 @@ elseif(CONFIG_BOARD_TYPE_HU_087)
     set(BUILTIN_ICON_FONT font_awesome_14_1)
 elseif(CONFIG_BOARD_TYPE_Freenove_ESP32S3_DISPLAY_2_8_LCD)
     set(BOARD_TYPE "freenove-esp32s3-display-2.8-lcd")
-    set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
-    set(BUILTIN_ICON_FONT font_awesome_20_4)
+    set(BUILTIN_TEXT_FONT font_puhui_basic_14_1)
+    set(BUILTIN_ICON_FONT font_awesome_14_1)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
 elseif(CONFIG_BOARD_TYPE_AI_VOX3)
     set(BOARD_TYPE "nulllab-ai-vox-v3")
@@ -834,6 +834,11 @@ elseif(CONFIG_BOARD_TYPE_AI_VOX3)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
 endif()
 
+# NOTE: board *.c/*.cc files (Vietnamese clock fonts font_vi_*.c, Zing MP3
+# client + music player) are globbed here; reconfigure cmake after adding new
+# ones so the glob re-runs.
+# Board sources are globbed; bump this comment to force a re-glob when adding a
+# new file (e.g. music_ui.cc, alarm_manager.cc).
 if(MANUFACTURER)
     file(GLOB BOARD_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/boards/${MANUFACTURER}/${BOARD_TYPE}/*.cc
@@ -1015,6 +1020,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_pm
                         esp_psram
                         esp_netif
+                        esp_http_server
                         esp_driver_gpio
                         esp_driver_uart
                         esp_driver_spi
